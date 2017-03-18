@@ -37,6 +37,8 @@
          ^:dynamic *suppress-read*
          default-data-readers)
 
+(def ^:dynamic *wrap-constants* false)
+
 (defn ^:private ns-name* [x]
   (if (instance? Namespace x)
     (name (ns-name x))
@@ -46,6 +48,38 @@
   (case ch
     (\" \; \@ \^ \` \~ \( \) \[ \] \{ \} \\) true
     false))
+
+(defn starting-line-col-info [rdr]
+  (when (indexing-reader? rdr)
+    [(get-line-number rdr) (int (dec (int (get-column-number rdr))))]))
+
+(defn ending-line-col-info [rdr]
+  (when (indexing-reader? rdr)
+    [(get-line-number rdr) (get-column-number rdr)]))
+
+(defn loc-info
+  ([loc-start rdr]
+    (loc-info loc-start rdr 0))
+  ([[start-line start-column :as loc-start] rdr start-col-offset]
+   (when loc-start
+     (merge
+       (when-let [file (get-file-name rdr)]
+         {:file file})
+       (let [[end-line end-column] (ending-line-col-info rdr)]
+         {:line start-line
+          :column (+ start-column start-col-offset)
+          :end-line end-line
+          :end-column end-column})))))
+
+(defrecord Constant [loc-info value])
+
+(defn constant? [x]
+  (instance? Constant x))
+
+(defn wrap-constant [loc-start rdr constant]
+  (if-not *wrap-constants*
+    constant
+    (Constant. (loc-info loc-start rdr) constant)))
 
 (defn- ^String read-token
   "Read in a single logical token from the reader"
@@ -81,10 +115,11 @@
 
 (defn read-regex
   [rdr ch opts pending-forms]
-  (let [sb (StringBuilder.)]
+  (let [loc-start (starting-line-col-info rdr)
+        sb (StringBuilder.)]
     (loop [ch (read-char rdr)]
       (if (identical? \" ch)
-        (Pattern/compile (str sb))
+        (wrap-constant loc-start rdr (Pattern/compile (str sb)))
         (if (nil? ch)
           (reader-error rdr "EOF while reading regex")
           (do
@@ -134,7 +169,7 @@
 (def ^:private ^:const upper-limit (int \uD7ff))
 (def ^:private ^:const lower-limit (int \uE000))
 
-(defn- read-char*
+(defn- read-char**
   "Read in a character literal"
   [rdr backslash opts pending-forms]
   (let [ch (read-char rdr)]
@@ -175,13 +210,12 @@
          :else (reader-error rdr "Unsupported character: \\" token)))
       (reader-error rdr "EOF while reading character"))))
 
-(defn ^:private starting-line-col-info [rdr]
-  (when (indexing-reader? rdr)
-    [(get-line-number rdr) (int (dec (int (get-column-number rdr))))]))
-
-(defn ^:private ending-line-col-info [rdr]
-  (when (indexing-reader? rdr)
-    [(get-line-number rdr) (get-column-number rdr)]))
+(defn- read-char*
+  [rdr backslash opts pending-forms]
+  (let [loc-start (starting-line-col-info rdr)
+        char (read-char** rdr backslash opts pending-forms)]
+    (wrap-constant loc-start rdr char)
+    ))
 
 (defonce ^:private READ_EOF (Object.))
 (defonce ^:private READ_FINISHED (Object.))
@@ -206,69 +240,47 @@
 (defn- read-list
   "Read in a list, including its location if the reader is an indexing reader"
   [rdr _ opts pending-forms]
-  (let [[start-line start-column] (starting-line-col-info rdr)
-        the-list (read-delimited \) rdr opts pending-forms)
-        [end-line end-column] (ending-line-col-info rdr)]
+  (let [loc-start (starting-line-col-info rdr)
+        the-list (read-delimited \) rdr opts pending-forms)]
     (with-meta (if (empty? the-list)
                  '()
                  (clojure.lang.PersistentList/create the-list))
-      (when start-line
-        (merge
-         (when-let [file (get-file-name rdr)]
-           {:file file})
-         {:line start-line
-          :column start-column
-          :end-line end-line
-          :end-column end-column})))))
+      (loc-info loc-start rdr))))
 
 (defn- read-vector
   "Read in a vector, including its location if the reader is an indexing reader"
   [rdr _ opts pending-forms]
-  (let [[start-line start-column] (starting-line-col-info rdr)
-        the-vector (read-delimited \] rdr opts pending-forms)
-        [end-line end-column] (ending-line-col-info rdr)]
+  (let [loc-start (starting-line-col-info rdr)
+        the-vector (read-delimited \] rdr opts pending-forms)]
     (with-meta the-vector
-      (when start-line
-        (merge
-         (when-let [file (get-file-name rdr)]
-           {:file file})
-         {:line start-line
-          :column start-column
-          :end-line end-line
-          :end-column end-column})))))
+      (loc-info loc-start rdr))))
 
 (defn- read-map
   "Read in a map, including its location if the reader is an indexing reader"
   [rdr _ opts pending-forms]
-  (let [[start-line start-column] (starting-line-col-info rdr)
+  (let [loc-start (starting-line-col-info rdr)
         the-map (read-delimited \} rdr opts pending-forms)
-        map-count (count the-map)
-        [end-line end-column] (ending-line-col-info rdr)]
+        map-count (count the-map)]
     (when (odd? map-count)
       (reader-error rdr "Map literal must contain an even number of forms"))
     (with-meta
       (if (zero? map-count)
         {}
         (RT/map (to-array the-map)))
-      (when start-line
-        (merge
-         (when-let [file (get-file-name rdr)]
-           {:file file})
-         {:line start-line
-          :column start-column
-          :end-line end-line
-          :end-column end-column})))))
+      (loc-info loc-start rdr))))
 
 (defn- read-number
   [rdr initch]
-  (loop [sb (doto (StringBuilder.) (.append initch))
-         ch (read-char rdr)]
-    (if (or (whitespace? ch) (macros ch) (nil? ch))
-      (let [s (str sb)]
-        (unread rdr ch)
-        (or (match-number s)
-            (reader-error rdr "Invalid number format [" s "]")))
-      (recur (doto sb (.append ch)) (read-char rdr)))))
+  (let [loc-start (starting-line-col-info rdr)]
+    (loop [sb (doto (StringBuilder.) (.append initch))
+           ch (read-char rdr)]
+      (if (or (whitespace? ch) (macros ch) (nil? ch))
+        (let [s (str sb)]
+          (unread rdr ch)
+          (or (when-let [num (match-number s)]
+                (wrap-constant loc-start rdr num))
+              (reader-error rdr "Invalid number format [" s "]")))
+        (recur (doto sb (.append ch)) (read-char rdr))))))
 
 (defn- escape-char [sb rdr]
   (let [ch (read-char rdr)]
@@ -293,41 +305,34 @@
 
 (defn- read-string*
   [reader _ opts pending-forms]
-  (loop [sb (StringBuilder.)
-         ch (read-char reader)]
-    (case ch
-      nil (reader-error reader "EOF while reading string")
-      \\ (recur (doto sb (.append (escape-char sb reader)))
-                (read-char reader))
-      \" (str sb)
-      (recur (doto sb (.append ch)) (read-char reader)))))
+  (let [loc-start (starting-line-col-info reader)]
+    (loop [sb (StringBuilder.)
+           ch (read-char reader)]
+      (case ch
+        nil (reader-error reader "EOF while reading string")
+        \\ (recur (doto sb (.append (escape-char sb reader)))
+             (read-char reader))
+        \" (wrap-constant loc-start reader (str sb))
+        (recur (doto sb (.append ch)) (read-char reader))))))
 
 (defn- read-symbol
   [rdr initch]
-  (let [[line column] (starting-line-col-info rdr)]
+  (let [loc-start (starting-line-col-info rdr)]
     (when-let [token (read-token rdr initch)]
       (case token
 
         ;; special symbols
-        "nil" nil
-        "true" true
-        "false" false
-        "/" '/
-        "NaN" Double/NaN
-        "-Infinity" Double/NEGATIVE_INFINITY
-        ("Infinity" "+Infinity") Double/POSITIVE_INFINITY
+        "nil" (wrap-constant loc-start rdr nil)
+        "true" (wrap-constant loc-start rdr true)
+        "false" (wrap-constant loc-start rdr false)
+        "/" '/ ;; FIXME: attach meta?
+        "NaN" (wrap-constant loc-start rdr Double/NaN)
+        "-Infinity" (wrap-constant loc-start rdr Double/NEGATIVE_INFINITY)
+        ("Infinity" "+Infinity") (wrap-constant loc-start rdr Double/POSITIVE_INFINITY)
 
         (or (when-let [p (parse-symbol token)]
               (with-meta (symbol (p 0) (p 1))
-                (when line
-                  (merge
-                   (when-let [file (get-file-name rdr)]
-                     {:file file})
-                   (let [[end-line end-column] (ending-line-col-info rdr)]
-                     {:line line
-                      :column column
-                      :end-line end-line
-                      :end-column end-column})))))
+                (loc-info loc-start rdr)))
             (reader-error rdr "Invalid token: " token))))))
 
 (def ^:dynamic *alias-map*
@@ -388,20 +393,11 @@
 
 (defn- read-set
   [rdr _ opts pending-forms]
-  (let [[start-line start-column] (starting-line-col-info rdr)
-        ;; subtract 1 from start-column so it includes the # in the leading #{
-        start-column (if start-column (int (dec (int start-column))))
-        the-set (PersistentHashSet/createWithCheck (read-delimited \} rdr opts pending-forms))
-        [end-line end-column] (ending-line-col-info rdr)]
+  (let [loc-start (starting-line-col-info rdr)
+        the-set (PersistentHashSet/createWithCheck (read-delimited \} rdr opts pending-forms))]
     (with-meta the-set
-      (when start-line
-        (merge
-         (when-let [file (get-file-name rdr)]
-           {:file file})
-         {:line start-line
-          :column start-column
-          :end-line end-line
-          :end-column end-column})))))
+      (loc-info loc-start rdr -1)
+      )))
 
 (defn- read-discard
   "Read and discard the first object from rdr"
